@@ -1,0 +1,151 @@
+name: Build FPS Overlay (Windows x64)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install MinGW toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-make
+
+      - name: Configure and compile
+        shell: msys2 {0}
+        run: |
+          cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+
+      - name: Download PresentMon runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ 'User-Agent' = 'FPSOverlay-CI' }
+          $release = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/GameTechDev/PresentMon/releases/latest'
+
+          New-Item -ItemType Directory -Force -Path 'tools\presentmon' | Out-Null
+          New-Item -ItemType Directory -Force -Path 'dist\portable' | Out-Null
+
+          # Recent PresentMon releases publish the standalone console app as a
+          # plain .exe asset (e.g. "PresentMon-2.5.1-x64.exe") - it is NOT
+          # zipped. Prefer that asset first.
+          $exeAsset = $release.assets |
+            Where-Object { $_.name -match '^PresentMon-.*-x64\.exe$' } |
+            Select-Object -First 1
+
+          if ($exeAsset) {
+            Invoke-WebRequest -Headers $headers -Uri $exeAsset.browser_download_url -OutFile 'dist\portable\PresentMon.exe'
+          }
+          else {
+            # Fallback for releases that do ship a zip. Some releases also
+            # publish a debug-symbols zip (e.g. "...x64-Symbols.zip") that
+            # matches a naive "*.zip" filter but contains only .pdb files -
+            # exclude those explicitly so we don't grab the wrong archive.
+            $zipAsset = $release.assets |
+              Where-Object { $_.name -match '\.zip$' -and $_.name -notmatch 'ymbol|debug|pdb' } |
+              Select-Object -First 1
+
+            if (-not $zipAsset) {
+              $names = ($release.assets | ForEach-Object { $_.name }) -join ', '
+              throw "Could not find a usable PresentMon x64 .exe or .zip asset in release '$($release.tag_name)'. Available assets: $names"
+            }
+
+            Invoke-WebRequest -Headers $headers -Uri $zipAsset.browser_download_url -OutFile 'tools\presentmon\presentmon.zip'
+            Expand-Archive -Force 'tools\presentmon\presentmon.zip' 'tools\presentmon\unpacked'
+
+            $exe = Get-ChildItem 'tools\presentmon\unpacked' -Recurse -File -Filter 'PresentMon*.exe' | Select-Object -First 1
+            if (-not $exe) {
+              $found = (Get-ChildItem 'tools\presentmon\unpacked' -Recurse -File | ForEach-Object { $_.Name }) -join ', '
+              throw "PresentMon executable was not found inside '$($zipAsset.name)'. Files in archive: $found"
+            }
+
+            Copy-Item -Force $exe.FullName 'dist\portable\PresentMon.exe'
+            Get-ChildItem $exe.Directory.FullName -File | Where-Object { $_.FullName -ne $exe.FullName } | Copy-Item -Destination 'dist\portable' -Force
+          }
+
+          if (-not (Test-Path 'dist\portable\PresentMon.exe')) {
+            throw 'PresentMon.exe was not staged into dist\portable after the download step.'
+          }
+
+      - name: Assemble portable package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Copy-Item -Force 'build\FpsOverlay.exe' 'dist\portable\FpsOverlay.exe'
+          Copy-Item -Force 'config.ini' 'dist\portable\config.ini'
+          Copy-Item -Force 'config.json' 'dist\portable\config.json'
+          Copy-Item -Force 'assets_overlay.png' 'dist\portable\assets_overlay.png'
+          Copy-Item -Force 'README.md' 'dist\portable\README.md'
+          Compress-Archive -Path 'dist\portable\*' -DestinationPath 'dist\FPSOverlay_Portable.zip' -Force
+          git archive --format=zip --prefix=FPSOverlay_Source/ HEAD -o dist/FPSOverlay_Source.zip
+
+      - name: Install NSIS
+        shell: pwsh
+        run: choco install nsis --yes --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          New-Item -ItemType Directory -Force -Path 'dist\portable' | Out-Null
+
+          # Fail fast with a clear message instead of letting makensis report
+          # a confusing "no files found" if the portable package step above
+          # didn't actually populate dist\portable.
+          $portableFiles = Get-ChildItem 'dist\portable' -File -Recurse -ErrorAction SilentlyContinue
+          if (-not $portableFiles) {
+            throw 'dist\portable is empty - nothing to package. Check the "Download PresentMon runtime" and "Assemble portable package" steps above.'
+          }
+
+          # Pass absolute paths into the script instead of relying on
+          # makensis's "cd to the .nsi file's folder" default behavior
+          # (and the script's own relative-path assumptions), which is what
+          # caused "File: dist\portable\*.* -> no files found" previously.
+          $portableDir = (Resolve-Path 'dist\portable').Path
+          $distDir = (Resolve-Path 'dist').Path
+
+          $makensis = (Get-Command makensis.exe -ErrorAction SilentlyContinue).Source
+          if (-not $makensis) { $makensis = 'C:\Program Files (x86)\NSIS\makensis.exe' }
+          if (-not (Test-Path $makensis)) { throw 'NSIS makensis.exe was not found.' }
+
+          & $makensis "/DAPP_VERSION=$env:GITHUB_REF_NAME" "/DPORTABLE_DIR=$portableDir" "/DDIST_DIR=$distDir" 'installer\installer.nsi'
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS installer build failed.' }
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FPSOverlay-Windows-x64
+          path: |
+            dist/FPSOverlay_Source.zip
+            dist/FPSOverlay_Portable.zip
+            dist/FPSOverlay_Setup.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release for version tags
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/FPSOverlay_Source.zip
+            dist/FPSOverlay_Portable.zip
+            dist/FPSOverlay_Setup.exe
+          generate_release_notes: true
