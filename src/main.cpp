@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <objbase.h>
 #include <vector>
 #include <string>
 #include "config.h"
