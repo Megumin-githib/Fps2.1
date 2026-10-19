@@ -202,3 +202,7 @@ Install CMake and a MinGW-w64 x64 toolchain, then run `build.bat` on Windows. `P
 - `FPSOverlay_Setup.exe` — NSIS installer.
 
 Pushing a version tag such as `v1.0.0` also creates a GitHub Release with those files. The workflow must be run in a GitHub repository; files in a local ZIP do not trigger GitHub Actions by themselves.
+
+      
+Это приложение создано полностью с помощью ИИ, и ничего не было изменено в коде человеком.
+This application was created entirely using AI, and no part of the code has been altered by a human.
