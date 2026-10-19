@@ -16,6 +16,7 @@ public:
     void Resize(int width, int height);
     void Update(float deltaSeconds = 0.016f); // time-based step; animation speed independent of FPS cap
     void Draw(Gdiplus::Graphics& g) const;
+    void ReleaseResources(); // call before GdiplusShutdown
 
 private:
     struct Fog {
@@ -26,8 +27,11 @@ private:
     };
 
     void Seed();
+    void CreateGlowTextures();
 
     int m_width = 0, m_height = 0;
+    Gdiplus::Bitmap* m_fogTexture = nullptr;
+    Gdiplus::Bitmap* m_particleTexture = nullptr;
     std::vector<Fog> m_fog;
     std::vector<Particle> m_particles;
     float m_t = 0.0f; // animation clock, advances each Update()

@@ -48,6 +48,10 @@ struct SettingsState {
     std::wstring cfgPath;
     HFONT font = nullptr;
     bool done = false;
+    bool fadingIn = false;
+    bool fadingOut = false;
+    ULONGLONG fadeStartMs = 0;
+    BYTE fadeStartAlpha = 0;
 
     HWND chkAutoConnect = nullptr, comboApp = nullptr, btnRefresh = nullptr, btnBrowse = nullptr;
     HWND chkShowTime = nullptr, chkShowFps = nullptr, chkShowLows = nullptr, chkShowCpu = nullptr;
@@ -147,6 +151,20 @@ void SaveFromControls(SettingsState* s) {
     cfg.Save(s->cfgPath);
 }
 
+void BeginSettingsFadeOut(SettingsState* s) {
+    if (!s || s->fadingOut) return;
+    const ULONGLONG now = GetTickCount64();
+    if (s->fadingIn) {
+        const float progress = (std::min)(1.0f, (float)(now - s->fadeStartMs) / 180.0f);
+        s->fadeStartAlpha = (BYTE)(255.0f * progress);
+    } else {
+        s->fadeStartAlpha = 255;
+    }
+    s->fadingIn = false;
+    s->fadingOut = true;
+    s->fadeStartMs = now;
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     SettingsState* s = g_state;
     switch (msg) {
@@ -163,19 +181,36 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (!picked.empty()) SetWindowTextW(s->comboApp, picked.c_str());
         } else if (id == ID_BTN_SAVE && HIWORD(wParam) == BN_CLICKED) {
             SaveFromControls(s);
-            s->done = true;
-            DestroyWindow(hwnd);
+            BeginSettingsFadeOut(s);
         } else if (id == ID_BTN_CANCEL && HIWORD(wParam) == BN_CLICKED) {
-            s->done = true;
-            DestroyWindow(hwnd);
+            BeginSettingsFadeOut(s);
         }
         return 0;
     }
     case WM_CLOSE:
-        s->done = true;
-        DestroyWindow(hwnd);
+        BeginSettingsFadeOut(s);
         return 0;
+    case WM_TIMER:
+        if (wParam == 1 && s) {
+            const ULONGLONG now = GetTickCount64();
+            if (s->fadingIn) {
+                const float progress = (std::min)(1.0f, (float)(now - s->fadeStartMs) / 180.0f);
+                SetLayeredWindowAttributes(hwnd, 0, (BYTE)(255.0f * progress), LWA_ALPHA);
+                if (progress >= 1.0f) s->fadingIn = false;
+            } else if (s->fadingOut) {
+                const float progress = (std::min)(1.0f, (float)(now - s->fadeStartMs) / 160.0f);
+                SetLayeredWindowAttributes(hwnd, 0, (BYTE)(s->fadeStartAlpha * (1.0f - progress)), LWA_ALPHA);
+                if (progress >= 1.0f) {
+                    KillTimer(hwnd, 1);
+                    DestroyWindow(hwnd);
+                }
+            }
+            return 0;
+        }
+        break;
     case WM_DESTROY:
+        if (s) s->done = true;
+        KillTimer(hwnd, 1);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -206,11 +241,15 @@ void ShowSettingsWindow(HINSTANCE hInst, HWND owner, AppConfig& cfg, const std::
     int x = ownerRect.left + ((ownerRect.right - ownerRect.left) - winW) / 2;
     int y = ownerRect.top + ((ownerRect.bottom - ownerRect.top) - winH) / 2;
 
-    HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, kClassName, L"Настройки — FPS Overlay",
+    HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_LAYERED, kClassName, L"Настройки — FPS Overlay",
                                  WS_POPUP | WS_CAPTION | WS_SYSMENU,
                                  x, y, winW, winH, owner, nullptr, hInst, nullptr);
     state.hwnd = hwnd;
     g_state = &state;
+    if (!hwnd) {
+        g_state = nullptr;
+        return;
+    }
 
     RECT rc; GetClientRect(hwnd, &rc);
     int clientW = rc.right - rc.left;
@@ -311,6 +350,10 @@ void ShowSettingsWindow(HINSTANCE hInst, HWND owner, AppConfig& cfg, const std::
     UpdateAppPickerEnabled(&state);
 
     EnableWindow(owner, FALSE);
+    SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+    state.fadingIn = true;
+    state.fadeStartMs = GetTickCount64();
+    SetTimer(hwnd, 1, 16, nullptr);
     ShowWindow(hwnd, SW_SHOW);
     SetForegroundWindow(hwnd);
 

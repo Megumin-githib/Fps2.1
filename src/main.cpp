@@ -12,8 +12,23 @@
 #include "process_utils.h"
 #include "network_monitor.h"
 #include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <thread>
 
 namespace {
+
+struct HardwareSnapshot {
+    double cpuUsage = 0.0;
+    double gpuUsage = 0.0;
+    double gpuVramMB = 0.0;
+    double cpuClockMHz = 0.0;
+    double cpuTempC = 0.0;
+    double gpuTempC = 0.0;
+    bool gpuAvailable = false;
+    bool cpuTempValid = false;
+    bool gpuTempValid = false;
+};
 
 std::wstring GetForegroundProcessName() {
     HWND fg = GetForegroundWindow();
@@ -44,12 +59,6 @@ std::wstring GetForegroundProcessName() {
 // auto_connect / target_process choice made on the Settings screen instead
 // of an implicit "auto" sentinel string.
 void RunOverlay(HINSTANCE hInst, AppConfig& cfg, const std::wstring& cfgPath) {
-    CpuMonitor cpu;
-    cpu.Init();
-
-    GpuMonitor gpu;
-    bool gpuOk = gpu.Init();
-
     FpsMonitor fps;
     SessionMonitor session;
     NetworkMonitor network(cfg.ping_host);
@@ -72,18 +81,65 @@ void RunOverlay(HINSTANCE hInst, AppConfig& cfg, const std::wstring& cfgPath) {
     OverlayWindow win;
     if (!win.Create(hInst, cfg, cfgPath)) return;
 
-    int tickCount = 0;
-    ULONGLONG lastHardwareSample = 0, lastSensorSample = 0, lastFpsSample = 0;
-    double cpuUsageCached = 0.0, gpuUsageCached = 0.0, gpuVramCachedMB = 0.0, cpuClockCachedMHz = 0.0;
-    double cpuTempCached = 0.0, gpuTempCached = 0.0;
-    bool cpuTempValid = false, gpuTempValid = false;
+    std::atomic<bool> stopHardware{ false };
+    std::mutex hardwareMutex;
+    HardwareSnapshot hardwareSnapshot{};
+    std::thread hardwareThread([&]() {
+        // Keep PDH, DXGI/NVAPI and WMI calls away from the window/message thread.
+        const HRESULT comResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const bool ownsCom = SUCCEEDED(comResult);
+
+        CpuMonitor cpu;
+        cpu.Init();
+        GpuMonitor gpu;
+        const bool gpuOk = gpu.Init();
+
+        HardwareSnapshot sample{};
+        sample.gpuAvailable = gpuOk;
+        ULONGLONG lastUsageSample = 0;
+        ULONGLONG lastTemperatureSample = GetTickCount64();
+
+        while (!stopHardware.load(std::memory_order_relaxed)) {
+            const ULONGLONG now = GetTickCount64();
+            if (lastUsageSample == 0 || now - lastUsageSample >= 250) {
+                sample.cpuUsage = cpu.GetUsagePercent();
+                sample.cpuClockMHz = cpu.GetFrequencyMHz();
+                if (gpuOk) {
+                    sample.gpuUsage = gpu.GetUsagePercent();
+                    sample.gpuVramMB = gpu.GetVramUsedBytes() / (1024.0 * 1024.0);
+                }
+                lastUsageSample = now;
+            }
+            if (lastTemperatureSample == 0 || now - lastTemperatureSample >= 1500) {
+                double temperature = 0.0;
+                sample.gpuTempValid = gpuOk && gpu.GetTemperatureC(temperature);
+                if (sample.gpuTempValid) sample.gpuTempC = temperature;
+                sample.cpuTempValid = GetCpuTemperatureC(temperature);
+                if (sample.cpuTempValid) sample.cpuTempC = temperature;
+                lastTemperatureSample = GetTickCount64();
+            }
+            {
+                std::lock_guard<std::mutex> lock(hardwareMutex);
+                hardwareSnapshot = sample;
+            }
+            for (int i = 0; i < 10 && !stopHardware.load(std::memory_order_relaxed); ++i)
+                Sleep(10);
+        }
+
+        gpu.Shutdown();
+        if (ownsCom) CoUninitialize();
+    });
+
+    ULONGLONG lastFpsSample = 0;
+    ULONGLONG lastForegroundCheck = 0;
     FpsStats fpsCached{};
 
     win.OnTick = [&]() {
-        // In auto-connect mode, re-check the foreground app periodically and
-        // retarget both FPS capture and the session counter if it changed
-        // (e.g. alt-tabbed into a different game).
-        if (cfg.auto_connect && (++tickCount % 4 == 0)) {
+        const ULONGLONG nowMs = GetTickCount64();
+        // Throttle discovery by wall-clock time; render FPS must not decide
+        // how often the app opens and queries foreground process handles.
+        if (cfg.auto_connect && (lastForegroundCheck == 0 || nowMs - lastForegroundCheck >= 400)) {
+            lastForegroundCheck = nowMs;
             std::wstring fg = GetForegroundProcessName();
             if (!fg.empty() && fg != currentTarget) {
                 if (!currentTarget.empty()) {
@@ -108,26 +164,10 @@ void RunOverlay(HINSTANCE hInst, AppConfig& cfg, const std::wstring& cfgPath) {
             activeGame.pos_x = cfg.pos_x; activeGame.pos_y = cfg.pos_y; activeGame.profile = cfg.profile;
         }
 
-        network.Update();
-        const ULONGLONG nowMs = GetTickCount64();
-        // Expensive counters and WMI thermal queries are sampled independently
-        // from rendering, so a 240 FPS HUD does not issue 240 hardware queries/sec.
-        if (nowMs - lastHardwareSample >= 250 || lastHardwareSample == 0) {
-            cpuUsageCached = cpu.GetUsagePercent();
-            cpuClockCachedMHz = cpu.GetFrequencyMHz();
-            if (gpuOk) {
-                gpuUsageCached = gpu.GetUsagePercent();
-                gpuVramCachedMB = gpu.GetVramUsedBytes() / (1024.0 * 1024.0);
-            }
-            lastHardwareSample = nowMs;
-        }
-        if (nowMs - lastSensorSample >= 1500 || lastSensorSample == 0) {
-            double sample = 0.0;
-            gpuTempValid = gpuOk && gpu.GetTemperatureC(sample);
-            if (gpuTempValid) gpuTempCached = sample;
-            cpuTempValid = GetCpuTemperatureC(sample);
-            if (cpuTempValid) cpuTempCached = sample;
-            lastSensorSample = nowMs;
+        HardwareSnapshot hw{};
+        {
+            std::lock_guard<std::mutex> lock(hardwareMutex);
+            hw = hardwareSnapshot;
         }
         if (nowMs - lastFpsSample >= 100 || lastFpsSample == 0) {
             fpsCached = fps.GetStats();
@@ -167,11 +207,11 @@ void RunOverlay(HINSTANCE hInst, AppConfig& cfg, const std::wstring& cfgPath) {
             lines.push_back(buf);
         }
         if (fullProfile && cfg.show_cpu) {
-            swprintf_s(buf, L"CPU: %.0f%%", cpuUsageCached);
+            swprintf_s(buf, L"CPU: %.0f%%", hw.cpuUsage);
             lines.push_back(buf);
         }
-        if (fullProfile && cfg.show_gpu && gpuOk) {
-            swprintf_s(buf, L"GPU: %.0f%%  VRAM: %.0f MB", gpuUsageCached, gpuVramCachedMB);
+        if (fullProfile && cfg.show_gpu && hw.gpuAvailable) {
+            swprintf_s(buf, L"GPU: %.0f%%  VRAM: %.0f MB", hw.gpuUsage, hw.gpuVramMB);
             lines.push_back(buf);
         }
         if (showPing) {
@@ -195,7 +235,7 @@ void RunOverlay(HINSTANCE hInst, AppConfig& cfg, const std::wstring& cfgPath) {
             }
         }
         if (fullProfile && cfg.show_frequencies) {
-            double cpuMhz = cpuClockCachedMHz;
+            double cpuMhz = hw.cpuClockMHz;
             if (cpuMhz > 0) swprintf_s(buf, L"CPU Clock: %.0f MHz", cpuMhz);
             else swprintf_s(buf, L"CPU Clock: N/A");
             lines.push_back(buf);
@@ -203,15 +243,15 @@ void RunOverlay(HINSTANCE hInst, AppConfig& cfg, const std::wstring& cfgPath) {
             lines.push_back(L"GPU Clock: N/A");
         }
         if (fullProfile && cfg.show_temps) {
-            if (gpuTempValid) {
-                swprintf_s(buf, L"GPU Temp: %.0f C", gpuTempCached);
+            if (hw.gpuTempValid) {
+                swprintf_s(buf, L"GPU Temp: %.0f C", hw.gpuTempC);
             } else {
                 swprintf_s(buf, L"GPU Temp: N/A");
             }
             lines.push_back(buf);
 
-            if (cpuTempValid) {
-                swprintf_s(buf, L"CPU Temp: %.0f C", cpuTempCached);
+            if (hw.cpuTempValid) {
+                swprintf_s(buf, L"CPU Temp: %.0f C", hw.cpuTempC);
             } else {
                 swprintf_s(buf, L"CPU Temp: N/A");
             }
@@ -223,8 +263,8 @@ void RunOverlay(HINSTANCE hInst, AppConfig& cfg, const std::wstring& cfgPath) {
         win.Render();
     };
 
-    const int overlayFps = (std::max)(1, (std::min)(240, cfg.overlay_fps));
-    SetTimer(win.Handle(), 1, (UINT)(1000 / overlayFps), nullptr);
+    // The initial fade needs ~60 Hz even if the steady-state HUD update rate is lower.
+    SetTimer(win.Handle(), 1, 16, nullptr);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
@@ -232,9 +272,11 @@ void RunOverlay(HINSTANCE hInst, AppConfig& cfg, const std::wstring& cfgPath) {
         DispatchMessageW(&msg);
     }
 
+    stopHardware.store(true, std::memory_order_relaxed);
+    if (hardwareThread.joinable()) hardwareThread.join();
+
     cfg.Save(cfgPath);
     fps.Stop();
-    gpu.Shutdown();
 }
 
 } // namespace

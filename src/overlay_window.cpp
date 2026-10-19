@@ -55,12 +55,19 @@ bool OverlayWindow::Create(HINSTANCE hInst, AppConfig& cfg, const std::wstring& 
     RegisterHotKey(m_hwnd, 2, 0, cfg.hotkey_toggle_clickthrough);
     RegisterHotKey(m_hwnd, 3, MOD_CONTROL | MOD_ALT, cfg.hotkey_cycle_profile);
 
+    m_windowAlpha = 0;
+    m_fadeStartAlpha = 0;
+    m_fadeTargetAlpha = 255;
+    m_fadeStartMs = GetTickCount64();
+    m_alphaAnimating = true;
     ShowWindow(m_hwnd, SW_SHOW);
     return true;
 }
 
 void OverlayWindow::SetLines(const std::vector<std::wstring>& lines) {
+    if (m_lines == lines) return;
     m_lines = lines;
+    m_contentDirty = true;
 }
 
 void OverlayWindow::ApplyExStyle() {
@@ -70,10 +77,43 @@ void OverlayWindow::ApplyExStyle() {
     SetWindowLongPtrW(m_hwnd, GWL_EXSTYLE, ex);
 }
 
+void OverlayWindow::BeginVisibilityFade(bool show, bool hideToTray) {
+    if (!m_hwnd) return;
+    const ULONGLONG now = GetTickCount64();
+    if (show) {
+        if (!m_visible) {
+            m_visible = true;
+            m_windowAlpha = 0;
+            ShowWindow(m_hwnd, SW_SHOW);
+            RemoveTrayIcon();
+        }
+        m_fadeStartAlpha = m_windowAlpha;
+        m_fadeTargetAlpha = 255;
+        m_fadeStartMs = now;
+        m_alphaAnimating = true;
+        m_hideAfterFade = false;
+        // Use a responsive timer while fading, independent of the normal HUD FPS cap.
+        SetTimer(m_hwnd, 1, 16, nullptr);
+        if (OnTick) OnTick();
+    } else {
+        if (!m_visible) return;
+        m_fadeStartAlpha = m_windowAlpha;
+        m_fadeTargetAlpha = 0;
+        m_fadeStartMs = now;
+        m_alphaAnimating = true;
+        m_hideAfterFade = hideToTray;
+    }
+}
+
 void OverlayWindow::ToggleVisible() {
-    m_visible = !m_visible;
-    ShowWindow(m_hwnd, m_visible ? SW_SHOW : SW_HIDE);
-    if (m_visible) RemoveTrayIcon(); else AddTrayIcon();
+    if (m_alphaAnimating && m_fadeTargetAlpha == 0) {
+        // Reverse an in-progress fade instead of making the user wait for it.
+        BeginVisibilityFade(true, false);
+    } else if (m_visible) {
+        BeginVisibilityFade(false, true);
+    } else {
+        BeginVisibilityFade(true, false);
+    }
 }
 
 void OverlayWindow::AddTrayIcon() {
@@ -100,11 +140,31 @@ void OverlayWindow::ToggleClickThrough() {
 
 void OverlayWindow::Render() {
     if (!m_hwnd || m_lines.empty()) return;
-    // Avoid unnecessary full-surface allocations when called more often than the configured cap.
-    ULONGLONG nowMs = GetTickCount64();
+    const ULONGLONG nowMs = GetTickCount64();
+    const bool secondImageActive = m_backgroundImage2 && m_cfg->image_rotate_seconds > 0 &&
+        ((nowMs / 1000ULL / (ULONGLONG)m_cfg->image_rotate_seconds) % 2ULL) == 1ULL;
+    if (secondImageActive != m_secondImageActive) {
+        m_secondImageActive = secondImageActive;
+        m_contentDirty = true;
+    }
+    // Position changes (for example when switching per-game profiles) must not
+    // be hidden by the content cache or by the configured render FPS cap.
+    if (!m_haveWindowPosition || m_lastWindowX != m_cfg->pos_x || m_lastWindowY != m_cfg->pos_y) {
+        SetWindowPos(m_hwnd, HWND_TOPMOST, m_cfg->pos_x, m_cfg->pos_y, 0, 0,
+                     SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        m_lastWindowX = m_cfg->pos_x;
+        m_lastWindowY = m_cfg->pos_y;
+        m_haveWindowPosition = true;
+    }
+    // When text/appearance is unchanged, only update the per-pixel layer during
+    // visibility fades. This avoids rerunning GDI+ for identical frames.
+    if (!m_contentDirty && !m_alphaAnimating) return;
+
     int cap = (std::max)(1, (std::min)(240, m_cfg->overlay_fps));
     ULONGLONG minFrameMs = (ULONGLONG)(1000 / cap);
-    if (m_lastRenderMs && nowMs - m_lastRenderMs < minFrameMs) return;
+    // Visibility transitions must be rendered at their own cadence even when
+    // the steady-state HUD cap is configured as low as 1 FPS.
+    if (!m_alphaAnimating && m_lastRenderMs && nowMs - m_lastRenderMs < minFrameMs) return;
     m_lastRenderMs = nowMs;
 
     const int padding = 10;
@@ -115,23 +175,49 @@ void OverlayWindow::Render() {
     const int height = padding * 2 + lineHeight * (int)m_lines.size();
 
     HDC screenDC = GetDC(nullptr);
-    HDC memDC = CreateCompatibleDC(screenDC);
+    if (!screenDC) return;
+    if (!m_memDC) m_memDC = CreateCompatibleDC(screenDC);
+    if (!m_memDC) {
+        ReleaseDC(nullptr, screenDC);
+        return;
+    }
 
-    BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = width;
-    bmi.bmiHeader.biHeight = -height; // top-down DIB
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
+    // Keep the DIB section alive across frames. Reallocating the entire
+    // layered-window surface at every tick creates avoidable GDI churn.
+    if (!m_bitmap || width != m_bitmapWidth || height != m_bitmapHeight) {
+        m_contentDirty = true;
+        BITMAPINFO bmi = {};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = width;
+        bmi.bmiHeader.biHeight = -height; // top-down DIB
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
 
-    void* bits = nullptr;
-    HBITMAP hBmp = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, hBmp);
+        if (m_bitmap) {
+            SelectObject(m_memDC, m_originalBitmap);
+            DeleteObject(m_bitmap);
+            m_bitmap = nullptr;
+            m_bitmapBits = nullptr;
+            m_originalBitmap = nullptr;
+        }
+        m_bitmap = CreateDIBSection(screenDC, &bmi, DIB_RGB_COLORS, &m_bitmapBits, nullptr, 0);
+        if (m_bitmap) {
+            m_originalBitmap = (HBITMAP)SelectObject(m_memDC, m_bitmap);
+            m_bitmapWidth = width;
+            m_bitmapHeight = height;
+        }
+    }
 
-    if (bits) {
+    if (!m_bitmap || !m_bitmapBits) {
+        ReleaseDC(nullptr, screenDC);
+        return;
+    }
+
+    if (m_contentDirty) {
+    {
         Gdiplus::Bitmap gdiBmp(width, height, width * 4,
-                                PixelFormat32bppPARGB, (BYTE*)bits);
+                                PixelFormat32bppPARGB, (BYTE*)m_bitmapBits);
         Gdiplus::Graphics g(&gdiBmp);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
@@ -154,10 +240,7 @@ void OverlayWindow::Render() {
         g.FillPath(&bgBrush, &path);
 
         // Optional timed rotation between two user-selected overlay images.
-        Gdiplus::Image* activeImage = m_backgroundImage;
-        if (m_backgroundImage2 && m_cfg->image_rotate_seconds > 0 &&
-            ((GetTickCount64() / 1000ULL / (ULONGLONG)m_cfg->image_rotate_seconds) % 2ULL) == 1ULL)
-            activeImage = m_backgroundImage2;
+        Gdiplus::Image* activeImage = m_secondImageActive ? m_backgroundImage2 : m_backgroundImage;
         // Crop-to-fill user image with configurable opacity, clipped to the rounded HUD panel.
         if (activeImage && activeImage->GetWidth() && activeImage->GetHeight() && m_cfg->image_opacity > 0) {
             const double sw = (double)activeImage->GetWidth();
@@ -218,19 +301,20 @@ void OverlayWindow::Render() {
         Gdiplus::Pen accent(Gdiplus::Color(180, 190, 70, 255), 1.0f);
         g.DrawLine(&accent, 18, height - 4, (std::min)(width - 18, 58), height - 4);
     }
+        m_contentDirty = false;
+    }
 
     POINT ptSrc = {0, 0};
     POINT ptDst = {m_cfg->pos_x, m_cfg->pos_y};
     SIZE sz = {width, height};
-    BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    BLENDFUNCTION blend = {AC_SRC_OVER, 0, m_windowAlpha, AC_SRC_ALPHA};
 
     SetWindowPos(m_hwnd, HWND_TOPMOST, m_cfg->pos_x, m_cfg->pos_y, width, height,
                  SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-    UpdateLayeredWindow(m_hwnd, screenDC, &ptDst, &sz, memDC, &ptSrc, 0, &blend, ULW_ALPHA);
-
-    SelectObject(memDC, oldBmp);
-    DeleteObject(hBmp);
-    DeleteDC(memDC);
+    m_lastWindowX = m_cfg->pos_x;
+    m_lastWindowY = m_cfg->pos_y;
+    m_haveWindowPosition = true;
+    UpdateLayeredWindow(m_hwnd, screenDC, &ptDst, &sz, m_memDC, &ptSrc, 0, &blend, ULW_ALPHA);
     ReleaseDC(nullptr, screenDC);
 }
 
@@ -257,6 +341,11 @@ LRESULT OverlayWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             POINT pt; GetCursorPos(&pt);
             m_cfg->pos_x = pt.x - m_dragOffset.x;
             m_cfg->pos_y = pt.y - m_dragOffset.y;
+            SetWindowPos(m_hwnd, HWND_TOPMOST, m_cfg->pos_x, m_cfg->pos_y, 0, 0,
+                         SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+            m_lastWindowX = m_cfg->pos_x;
+            m_lastWindowY = m_cfg->pos_y;
+            m_haveWindowPosition = true;
             Render();
         }
         return 0;
@@ -281,19 +370,37 @@ LRESULT OverlayWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_TIMER:
+        if (m_alphaAnimating) {
+            const ULONGLONG now = GetTickCount64();
+            const float progress = (std::min)(1.0f, (float)(now - m_fadeStartMs) / 220.0f);
+            const float alpha = (float)m_fadeStartAlpha +
+                ((float)m_fadeTargetAlpha - (float)m_fadeStartAlpha) * progress;
+            m_windowAlpha = (BYTE)(std::max)(0.0f, (std::min)(255.0f, alpha));
+            if (progress >= 1.0f) {
+                m_alphaAnimating = false;
+                if (m_fadeTargetAlpha == 0) {
+                    m_visible = false;
+                    ShowWindow(m_hwnd, SW_HIDE);
+                    if (m_hideAfterFade) AddTrayIcon();
+                    KillTimer(m_hwnd, 1);
+                    return 0;
+                }
+                // Force one final composition at fully opaque alpha.
+                m_contentDirty = true;
+                m_visible = true;
+                // Return to the configured update cadence once the transition ends.
+                SetTimer(m_hwnd, 1, (UINT)(1000 / (std::max)(1, (std::min)(240, m_cfg->overlay_fps))), nullptr);
+            }
+        }
         if (OnTick) OnTick();
         return 0;
     case WM_CLOSE:
-        m_visible = false;
-        KillTimer(m_hwnd, 1);
-        ShowWindow(m_hwnd, SW_HIDE);
-        AddTrayIcon();
+        BeginVisibilityFade(false, true);
         return 0;
     case WM_TRAYICON:
         if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
-            m_visible = true; ShowWindow(m_hwnd, SW_SHOW); SetForegroundWindow(m_hwnd); RemoveTrayIcon();
-            SetTimer(m_hwnd, 1, (UINT)(1000 / (std::max)(1, (std::min)(240, m_cfg->overlay_fps))), nullptr);
-            if (OnTick) OnTick();
+            SetForegroundWindow(m_hwnd);
+            BeginVisibilityFade(true, false);
         } else if (lParam == WM_RBUTTONUP) {
             POINT pt{}; GetCursorPos(&pt);
             HMENU menu = CreatePopupMenu();
@@ -307,9 +414,9 @@ LRESULT OverlayWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_COMMAND:
         if (LOWORD(wParam) == ID_TRAY_SHOW) {
-            m_visible = true; ShowWindow(m_hwnd, SW_SHOW); SetForegroundWindow(m_hwnd); RemoveTrayIcon();
-            SetTimer(m_hwnd, 1, (UINT)(1000 / (std::max)(1, (std::min)(240, m_cfg->overlay_fps))), nullptr);
-            if (OnTick) OnTick(); return 0;
+            SetForegroundWindow(m_hwnd);
+            BeginVisibilityFade(true, false);
+            return 0;
         }
         if (LOWORD(wParam) == ID_TRAY_EXIT) { RemoveTrayIcon(); DestroyWindow(m_hwnd); return 0; }
         break;
@@ -320,6 +427,16 @@ LRESULT OverlayWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         UnregisterHotKey(m_hwnd, 3);
         if (m_backgroundImage) { delete m_backgroundImage; m_backgroundImage = nullptr; }
         if (m_backgroundImage2) { delete m_backgroundImage2; m_backgroundImage2 = nullptr; }
+        if (m_memDC) {
+            if (m_originalBitmap) SelectObject(m_memDC, m_originalBitmap);
+            if (m_bitmap) DeleteObject(m_bitmap);
+            DeleteDC(m_memDC);
+            m_memDC = nullptr;
+            m_bitmap = nullptr;
+            m_originalBitmap = nullptr;
+            m_bitmapBits = nullptr;
+            m_bitmapWidth = m_bitmapHeight = 0;
+        }
         if (m_gdiplusToken) { Gdiplus::GdiplusShutdown(m_gdiplusToken); m_gdiplusToken = 0; }
         PostQuitMessage(0);
         return 0;

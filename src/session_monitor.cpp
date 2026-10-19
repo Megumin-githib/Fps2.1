@@ -42,6 +42,13 @@ bool SessionMonitor::TryReadProcessStart(const std::wstring& exeName, ULONGLONG&
 }
 
 void SessionMonitor::AttachOrUpdate(const std::wstring& exeName) {
+    const ULONGLONG nowMs = GetTickCount64();
+    // Process discovery is not required every render frame. Polling once per
+    // second keeps the session timer responsive without repeated snapshots.
+    if (m_exeName == exeName && m_lastCheckMs != 0 && nowMs - m_lastCheckMs < 1000)
+        return;
+    m_lastCheckMs = nowMs;
+
     bool running = IsProcessRunning(exeName);
 
     if (!running) {

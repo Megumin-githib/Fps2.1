@@ -64,11 +64,27 @@ std::vector<ProcessInfo> EnumerateRunningProcesses() {
 }
 
 bool IsProcessRunning(const std::wstring& exeName) {
-    std::wstring target = ToLower(exeName);
-    for (auto& p : EnumerateRunningProcesses()) {
-        if (ToLower(p.exe_name) == target) return true;
+    if (exeName.empty()) return false;
+
+    // This is a yes/no query used by the session tracker, not the settings
+    // picker. Stop at the first match; avoid allocating, de-duplicating and
+    // sorting a complete vector of all running processes.
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+
+    bool found = false;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, exeName.c_str()) == 0) {
+                found = true;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
     }
-    return false;
+    CloseHandle(snap);
+    return found;
 }
 
 std::wstring BrowseForExecutable(HWND owner) {

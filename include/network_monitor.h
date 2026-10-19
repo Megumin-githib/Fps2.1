@@ -33,12 +33,15 @@ public:
     void SetHost(const std::wstring& host);
 private:
     void PingLoop();
+    void AdapterLoop();
     std::wstring m_host;
     NetworkStats m_stats;
     mutable std::mutex m_mutex;
     std::atomic<bool> m_running{true};
-    std::thread m_pingThread;
+    // State used by AdapterLoop is constructed before either worker starts.
     ULONGLONG m_lastSample = 0;
     ULONGLONG m_prevIn = 0, m_prevOut = 0;
     bool m_haveBaseline = false;
+    std::thread m_pingThread;
+    std::thread m_adapterThread;
 };

@@ -26,6 +26,8 @@ private:
 
     void Layout();
     void Paint(HDC hdc);
+    void BeginFadeIn();
+    void BeginFadeOut(bool hideToTray);
     int HitTestButton(int x, int y) const; // -1 none, 0 Start, 1 Settings, 2 Exit
     void OpenSettings();
     void AddTrayIcon();
@@ -38,10 +40,23 @@ private:
 
     ParticleBackground m_bg;
     ULONG_PTR m_gdiplusToken = 0;
+    HDC m_paintDC = nullptr;
+    HBITMAP m_paintBitmap = nullptr;
+    HBITMAP m_paintOriginalBitmap = nullptr;
+    int m_paintWidth = 0, m_paintHeight = 0;
 
     RECT m_btnStart{}, m_btnSettings{}, m_btnExit{};
     int m_hoverBtn = -1;
+    int m_pressedBtn = -1;
+    float m_hoverAmounts[3] = { 0.0f, 0.0f, 0.0f };
+    float m_pressAmounts[3] = { 0.0f, 0.0f, 0.0f };
     int m_width = 0, m_height = 0;
+    ULONGLONG m_lastAnimTickMs = 0;
+    ULONGLONG m_fadeStartMs = 0;
+    bool m_fadingIn = false;
+    bool m_fadingOut = false;
+    bool m_hideAfterFade = false;
+    BYTE m_fadeStartAlpha = 0;
 
     LauncherAction m_result = LauncherAction::None;
     bool m_trayAdded = false;

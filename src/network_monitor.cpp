@@ -15,13 +15,16 @@
 
 NetworkMonitor::NetworkMonitor(std::wstring host)
     : m_host(std::move(host)),
-      m_pingThread(&NetworkMonitor::PingLoop, this) {}
+      m_pingThread(&NetworkMonitor::PingLoop, this),
+      m_adapterThread(&NetworkMonitor::AdapterLoop, this) {}
 
 NetworkMonitor::~NetworkMonitor() {
     m_running = false;
 
     if (m_pingThread.joinable())
         m_pingThread.join();
+    if (m_adapterThread.joinable())
+        m_adapterThread.join();
 }
 
 void NetworkMonitor::SetHost(const std::wstring& host) {
@@ -100,6 +103,14 @@ void NetworkMonitor::Update() {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_stats.download_mbps = down;
     m_stats.upload_mbps = up;
+}
+
+void NetworkMonitor::AdapterLoop() {
+    while (m_running) {
+        Update();
+        // Short sleep slices make shutdown responsive.
+        for (int i = 0; i < 50 && m_running; ++i) Sleep(20);
+    }
 }
 
 void NetworkMonitor::PingLoop() {

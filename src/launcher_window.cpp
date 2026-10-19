@@ -5,6 +5,7 @@
 #include <string>
 #include <shellapi.h>
 #include <algorithm>
+#include <cmath>
 #pragma comment(lib, "gdiplus.lib")
 
 using namespace Gdiplus;
@@ -55,8 +56,14 @@ int LauncherWindow::HitTestButton(int x, int y) const {
 }
 
 namespace {
-void DrawButton(Graphics& g, const RECT& r, const wchar_t* label, bool hover, const FontFamily& ff) {
-    Rect rect(r.left, r.top, r.right - r.left, r.bottom - r.top);
+BYTE LerpByte(BYTE from, BYTE to, float amount) {
+    amount = (std::max)(0.0f, (std::min)(1.0f, amount));
+    return (BYTE)(from + (to - from) * amount);
+}
+
+void DrawButton(Graphics& g, const RECT& r, const wchar_t* label, float hover, float press, const FontFamily& ff) {
+    const int yOffset = (int)(2.0f * press);
+    Rect rect(r.left, r.top + yOffset, r.right - r.left, r.bottom - r.top);
     GraphicsPath path;
     const int radius = 10;
     path.AddArc(rect.X, rect.Y, radius * 2, radius * 2, 180, 90);
@@ -65,36 +72,51 @@ void DrawButton(Graphics& g, const RECT& r, const wchar_t* label, bool hover, co
     path.AddArc(rect.X, rect.Y + rect.Height - radius * 2, radius * 2, radius * 2, 90, 90);
     path.CloseFigure();
 
-    if (hover) {
-        LinearGradientBrush fill(rect, Color(230, 60, 90, 150), Color(230, 40, 60, 120), LinearGradientModeVertical);
-        g.FillPath(&fill, &path);
-        Pen border(Color(255, 150, 190, 255), 1.6f);
-        g.DrawPath(&border, &path);
-    } else {
-        LinearGradientBrush fill(rect, Color(190, 28, 32, 50), Color(190, 18, 20, 36), LinearGradientModeVertical);
-        g.FillPath(&fill, &path);
-        Pen border(Color(140, 90, 100, 140), 1.0f);
-        g.DrawPath(&border, &path);
-    }
+    const Color fillTop(LerpByte(190, 230, hover), LerpByte(28, 60, hover),
+                        LerpByte(32, 90, hover), LerpByte(50, 150, hover));
+    const Color fillBottom(LerpByte(190, 230, hover), LerpByte(18, 40, hover),
+                           LerpByte(20, 60, hover), LerpByte(36, 120, hover));
+    LinearGradientBrush fill(rect, fillTop, fillBottom, LinearGradientModeVertical);
+    g.FillPath(&fill, &path);
+
+    Pen border(Color(LerpByte(140, 255, hover), LerpByte(90, 150, hover),
+                     LerpByte(100, 190, hover), LerpByte(140, 255, hover)),
+               1.0f + 0.6f * hover);
+    g.DrawPath(&border, &path);
 
     Font font(&ff, 17.0f, FontStyleBold, UnitPixel);
-    SolidBrush textBrush(hover ? Color(255, 255, 255, 255) : Color(230, 215, 220, 235));
+    SolidBrush textBrush(Color(LerpByte(230, 255, hover), LerpByte(215, 255, hover),
+                               LerpByte(220, 255, hover), LerpByte(235, 255, hover)));
     StringFormat fmt;
     fmt.SetAlignment(StringAlignmentCenter);
     fmt.SetLineAlignment(StringAlignmentCenter);
-    RectF textRect((Gdiplus::REAL)r.left, (Gdiplus::REAL)r.top, (Gdiplus::REAL)(r.right - r.left), (Gdiplus::REAL)(r.bottom - r.top));
+    RectF textRect((Gdiplus::REAL)r.left, (Gdiplus::REAL)(r.top + yOffset), (Gdiplus::REAL)(r.right - r.left), (Gdiplus::REAL)(r.bottom - r.top));
     g.DrawString(label, -1, &font, textRect, &fmt, &textBrush);
 }
 } // namespace
 
 void LauncherWindow::Paint(HDC hdc) {
     RECT rc; GetClientRect(m_hwnd, &rc);
-    HDC memDC = CreateCompatibleDC(hdc);
-    HBITMAP bmp = CreateCompatibleBitmap(hdc, m_width, m_height);
-    HBITMAP old = (HBITMAP)SelectObject(memDC, bmp);
+    if (m_width <= 0 || m_height <= 0) return;
+    if (!m_paintDC) m_paintDC = CreateCompatibleDC(hdc);
+    if (!m_paintDC) return;
+
+    if (!m_paintBitmap || m_paintWidth != m_width || m_paintHeight != m_height) {
+        if (m_paintBitmap) {
+            SelectObject(m_paintDC, m_paintOriginalBitmap);
+            DeleteObject(m_paintBitmap);
+            m_paintBitmap = nullptr;
+            m_paintOriginalBitmap = nullptr;
+        }
+        m_paintBitmap = CreateCompatibleBitmap(hdc, m_width, m_height);
+        if (!m_paintBitmap) return;
+        m_paintOriginalBitmap = (HBITMAP)SelectObject(m_paintDC, m_paintBitmap);
+        m_paintWidth = m_width;
+        m_paintHeight = m_height;
+    }
 
     {
-        Graphics g(memDC);
+        Graphics g(m_paintDC);
         g.SetSmoothingMode(SmoothingModeAntiAlias);
         g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
 
@@ -141,9 +163,9 @@ void LauncherWindow::Paint(HDC hdc) {
         RectF subRect(0.0f, (Gdiplus::REAL)(m_height / 2 - 110), (Gdiplus::REAL)m_width, 30.0f);
         g.DrawString(status.c_str(), -1, &subFont, subRect, &centerFmt, &subBrush);
 
-        DrawButton(g, m_btnStart, L"Запустить", m_hoverBtn == 0, ff);
-        DrawButton(g, m_btnSettings, L"Настройки", m_hoverBtn == 1, ff);
-        DrawButton(g, m_btnExit, L"Выход", m_hoverBtn == 2, ff);
+        DrawButton(g, m_btnStart, L"Запустить", m_hoverAmounts[0], m_pressAmounts[0], ff);
+        DrawButton(g, m_btnSettings, L"Настройки", m_hoverAmounts[1], m_pressAmounts[1], ff);
+        DrawButton(g, m_btnExit, L"Выход", m_hoverAmounts[2], m_pressAmounts[2], ff);
 
         // Footer hint
         Font footFont(&ff, 12.0f, FontStyleRegular, UnitPixel);
@@ -155,10 +177,33 @@ void LauncherWindow::Paint(HDC hdc) {
                       &footFont, footRect, &footFmt, &footBrush);
     }
 
-    BitBlt(hdc, 0, 0, m_width, m_height, memDC, 0, 0, SRCCOPY);
-    SelectObject(memDC, old);
-    DeleteObject(bmp);
-    DeleteDC(memDC);
+    BitBlt(hdc, 0, 0, m_width, m_height, m_paintDC, 0, 0, SRCCOPY);
+}
+
+void LauncherWindow::BeginFadeIn() {
+    if (!m_hwnd) return;
+    m_fadingOut = false;
+    m_hideAfterFade = false;
+    m_fadingIn = true;
+    m_fadeStartMs = GetTickCount64();
+    m_lastAnimTickMs = m_fadeStartMs;
+    m_fadeStartAlpha = 0;
+    SetLayeredWindowAttributes(m_hwnd, 0, 0, LWA_ALPHA);
+    SetTimer(m_hwnd, kAnimTimerId, 16, nullptr);
+}
+
+void LauncherWindow::BeginFadeOut(bool hideToTray) {
+    if (!m_hwnd || m_fadingOut) return;
+    const ULONGLONG now = GetTickCount64();
+    m_fadeStartAlpha = m_fadingIn
+        ? (BYTE)(255.0f * (std::min)(1.0f, (float)(now - m_fadeStartMs) / 240.0f))
+        : 255;
+    m_fadingIn = false;
+    m_fadingOut = true;
+    m_hideAfterFade = hideToTray;
+    m_fadeStartMs = now;
+    m_lastAnimTickMs = now;
+    SetTimer(m_hwnd, kAnimTimerId, 16, nullptr);
 }
 
 void LauncherWindow::OpenSettings() {
@@ -188,18 +233,72 @@ LRESULT LauncherWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_TIMER:
         if (wParam == kAnimTimerId) {
-            const float frameSeconds = 1.0f / (float)(std::max)(1, (std::min)(240, m_cfg->launcher_fps));
+            const ULONGLONG nowMs = GetTickCount64();
+            float frameSeconds = m_lastAnimTickMs == 0
+                ? 1.0f / (float)(std::max)(1, (std::min)(240, m_cfg->launcher_fps))
+                : (float)(nowMs - m_lastAnimTickMs) / 1000.0f;
+            m_lastAnimTickMs = nowMs;
+            frameSeconds = (std::max)(0.0f, (std::min)(0.1f, frameSeconds));
+
+            if (m_fadingIn) {
+                const float progress = (std::min)(1.0f, (float)(nowMs - m_fadeStartMs) / 240.0f);
+                const BYTE alpha = (BYTE)(255.0f * progress);
+                SetLayeredWindowAttributes(m_hwnd, 0, alpha, LWA_ALPHA);
+                if (progress >= 1.0f) {
+                    m_fadingIn = false;
+                    SetTimer(m_hwnd, kAnimTimerId,
+                             (UINT)(1000 / (std::max)(1, (std::min)(240, m_cfg->launcher_fps))), nullptr);
+                }
+            }
+            if (m_fadingOut) {
+                const float progress = (std::min)(1.0f, (float)(nowMs - m_fadeStartMs) / 200.0f);
+                const BYTE alpha = (BYTE)(m_fadeStartAlpha * (1.0f - progress));
+                SetLayeredWindowAttributes(m_hwnd, 0, alpha, LWA_ALPHA);
+                if (progress >= 1.0f) {
+                    m_fadingOut = false;
+                    if (m_hideAfterFade) {
+                        KillTimer(m_hwnd, kAnimTimerId);
+                        ShowWindow(m_hwnd, SW_HIDE);
+                        AddTrayIcon();
+                    } else {
+                        RemoveTrayIcon();
+                        DestroyWindow(m_hwnd);
+                    }
+                    return 0;
+                }
+                InvalidateRect(m_hwnd, nullptr, FALSE);
+                return 0;
+            }
+
+            bool hoverChanging = false;
+            for (int i = 0; i < 3; ++i) {
+                const float target = (m_hoverBtn == i) ? 1.0f : 0.0f;
+                const float old = m_hoverAmounts[i];
+                const float blend = (std::min)(1.0f, frameSeconds * 14.0f);
+                m_hoverAmounts[i] += (target - m_hoverAmounts[i]) * blend;
+                if (std::fabs(m_hoverAmounts[i] - target) < 0.01f) m_hoverAmounts[i] = target;
+                if (std::fabs(m_hoverAmounts[i] - old) > 0.002f) hoverChanging = true;
+
+                const float pressTarget = (m_pressedBtn == i) ? 1.0f : 0.0f;
+                const float oldPress = m_pressAmounts[i];
+                const float pressBlend = (std::min)(1.0f, frameSeconds * 24.0f);
+                m_pressAmounts[i] += (pressTarget - m_pressAmounts[i]) * pressBlend;
+                if (std::fabs(m_pressAmounts[i] - pressTarget) < 0.01f) m_pressAmounts[i] = pressTarget;
+                if (std::fabs(m_pressAmounts[i] - oldPress) > 0.002f) hoverChanging = true;
+            }
+
             if (GetForegroundWindow() == m_hwnd) {
                 m_bg.Update(frameSeconds);
                 InvalidateRect(m_hwnd, nullptr, FALSE);
             } else {
-                // Update/redraw only every eighth timer tick while unfocused.
+                // Lower redraw pressure while the launcher is in the background.
                 static unsigned idleTick = 0;
                 if ((++idleTick % 8) == 0) {
                     m_bg.Update(frameSeconds * 8.0f);
                     InvalidateRect(m_hwnd, nullptr, FALSE);
                 }
             }
+            if (hoverChanging) InvalidateRect(m_hwnd, nullptr, FALSE);
         }
         return 0;
     case WM_MOUSEMOVE: {
@@ -211,41 +310,50 @@ LRESULT LauncherWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     }
+    case WM_LBUTTONDOWN: {
+        int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
+        m_pressedBtn = HitTestButton(x, y);
+        if (m_pressedBtn >= 0) SetCapture(m_hwnd);
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return 0;
+    }
     case WM_LBUTTONUP: {
         int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
         int hit = HitTestButton(x, y);
+        m_pressedBtn = -1;
+        if (GetCapture() == m_hwnd) ReleaseCapture();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
         if (hit == 0) {
             m_result = LauncherAction::Start;
             RemoveTrayIcon();
-            DestroyWindow(m_hwnd);
+            BeginFadeOut(false);
         } else if (hit == 1) {
             OpenSettings();
         } else if (hit == 2) {
             m_result = LauncherAction::Exit;
             RemoveTrayIcon();
-            DestroyWindow(m_hwnd);
+            BeginFadeOut(false);
         }
         return 0;
     }
     case WM_KEYDOWN:
         if (wParam == VK_RETURN) {
             m_result = LauncherAction::Start;
-            DestroyWindow(m_hwnd);
+            BeginFadeOut(false);
         } else if (wParam == VK_ESCAPE) {
             m_result = LauncherAction::Exit;
             RemoveTrayIcon();
-            DestroyWindow(m_hwnd);
+            BeginFadeOut(false);
         }
         return 0;
     case WM_CLOSE:
-        KillTimer(m_hwnd, kAnimTimerId);
-        ShowWindow(m_hwnd, SW_HIDE);
-        AddTrayIcon();
+        BeginFadeOut(true);
         return 0;
     case WM_LAUNCHER_TRAY:
         if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
             ShowWindow(m_hwnd, SW_SHOW); SetForegroundWindow(m_hwnd); RemoveTrayIcon();
             SetTimer(m_hwnd, kAnimTimerId, (UINT)(1000 / (std::max)(1, (std::min)(240, m_cfg->launcher_fps))), nullptr);
+            BeginFadeIn();
         } else if (lParam == WM_RBUTTONUP) {
             POINT pt{}; GetCursorPos(&pt);
             HMENU menu = CreatePopupMenu();
@@ -260,12 +368,17 @@ LRESULT LauncherWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_COMMAND:
         if (LOWORD(wParam) == ID_LAUNCHER_TRAY_SHOW) {
             ShowWindow(m_hwnd, SW_SHOW); SetForegroundWindow(m_hwnd); RemoveTrayIcon();
-            SetTimer(m_hwnd, kAnimTimerId, (UINT)(1000 / (std::max)(1, (std::min)(240, m_cfg->launcher_fps))), nullptr); return 0;
+            SetTimer(m_hwnd, kAnimTimerId, (UINT)(1000 / (std::max)(1, (std::min)(240, m_cfg->launcher_fps))), nullptr);
+            BeginFadeIn(); return 0;
         }
         if (LOWORD(wParam) == ID_LAUNCHER_TRAY_EXIT) {
             m_result = LauncherAction::Exit; RemoveTrayIcon(); DestroyWindow(m_hwnd); return 0;
         }
         break;
+    case WM_CAPTURECHANGED:
+        m_pressedBtn = -1;
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return 0;
     case WM_ERASEBKGND:
         return 1; // avoid flicker - WM_PAINT fully repaints every pixel
     case WM_PAINT: {
@@ -278,6 +391,15 @@ LRESULT LauncherWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DESTROY:
         RemoveTrayIcon();
         KillTimer(m_hwnd, kAnimTimerId);
+        if (m_paintDC) {
+            if (m_paintOriginalBitmap) SelectObject(m_paintDC, m_paintOriginalBitmap);
+            if (m_paintBitmap) DeleteObject(m_paintBitmap);
+            DeleteDC(m_paintDC);
+            m_paintDC = nullptr;
+            m_paintBitmap = nullptr;
+            m_paintOriginalBitmap = nullptr;
+            m_paintWidth = m_paintHeight = 0;
+        }
         PostQuitMessage(0);
         return 0;
     }
@@ -306,10 +428,11 @@ LauncherAction LauncherWindow::Run(HINSTANCE hInst, AppConfig& cfg, const std::w
     int screenH = GetSystemMetrics(SM_CYSCREEN);
     m_bg.Init(screenW, screenH);
 
-    m_hwnd = CreateWindowExW(WS_EX_APPWINDOW, kClassName, L"FPS Overlay",
+    m_hwnd = CreateWindowExW(WS_EX_APPWINDOW | WS_EX_LAYERED, kClassName, L"FPS Overlay",
                               WS_POPUP, 0, 0, screenW, screenH,
                               nullptr, nullptr, hInst, nullptr);
     if (!m_hwnd) {
+        m_bg.ReleaseResources();
         GdiplusShutdown(m_gdiplusToken);
         return LauncherAction::Exit;
     }
@@ -320,9 +443,12 @@ LauncherAction LauncherWindow::Run(HINSTANCE hInst, AppConfig& cfg, const std::w
     // calling Layout()/SetTimer(m_hwnd, ...) from there would run against
     // a still-null handle and silently corrupt the first frame.
     Layout();
-    int launcherFps = (std::max)(1, (std::min)(240, cfg.launcher_fps));
-    SetTimer(m_hwnd, kAnimTimerId, (UINT)(1000 / launcherFps), nullptr);
+    SetTimer(m_hwnd, kAnimTimerId, 16, nullptr);
 
+    SetLayeredWindowAttributes(m_hwnd, 0, 0, LWA_ALPHA);
+    m_fadingIn = true;
+    m_fadeStartMs = GetTickCount64();
+    m_lastAnimTickMs = m_fadeStartMs;
     ShowWindow(m_hwnd, SW_SHOW);
     SetForegroundWindow(m_hwnd);
 
@@ -332,6 +458,7 @@ LauncherAction LauncherWindow::Run(HINSTANCE hInst, AppConfig& cfg, const std::w
         DispatchMessageW(&msg);
     }
 
+    m_bg.ReleaseResources();
     GdiplusShutdown(m_gdiplusToken);
     g_instance = nullptr;
     return m_result;

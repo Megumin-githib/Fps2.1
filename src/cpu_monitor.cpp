@@ -61,7 +61,7 @@ double CpuMonitor::GetUsagePercent() {
 
 // ---------------------------------------------------------------------
 // CPU temperature via WMI. Requires COM to already be initialized
-// (CoInitializeEx) on the calling thread - main.cpp does this at startup.
+// (CoInitializeEx) on the calling thread - the hardware sampler owns its COM apartment.
 // ---------------------------------------------------------------------
 #include <comdef.h>
 #include <wbemidl.h>
@@ -93,7 +93,7 @@ bool GetCpuTemperatureC(double& outC) {
     if (SUCCEEDED(hr) && enumerator) {
         IWbemClassObject* obj = nullptr;
         ULONG returned = 0;
-        if (enumerator->Next(WBEM_INFINITE, 1, &obj, &returned) == S_OK && returned > 0) {
+        if (enumerator->Next(1000, 1, &obj, &returned) == S_OK && returned > 0) {
             VARIANT v;
             VariantInit(&v);
             if (SUCCEEDED(obj->Get(L"CurrentTemperature", 0, &v, nullptr, nullptr)) &&

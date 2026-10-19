@@ -32,6 +32,7 @@ private:
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
     LRESULT HandleMessage(UINT, WPARAM, LPARAM);
     void ApplyExStyle();
+    void BeginVisibilityFade(bool show, bool hideToTray);
     void AddTrayIcon();
     void RemoveTrayIcon();
 
@@ -39,6 +40,11 @@ private:
     AppConfig* m_cfg = nullptr;
     std::wstring m_cfgPath;
     std::vector<std::wstring> m_lines;
+    bool m_contentDirty = true;
+    bool m_secondImageActive = false;
+    bool m_haveWindowPosition = false;
+    int m_lastWindowX = 0;
+    int m_lastWindowY = 0;
     bool m_visible = true;
     bool m_dragging = false;
     POINT m_dragOffset{};
@@ -46,5 +52,17 @@ private:
     Gdiplus::Image* m_backgroundImage = nullptr;
     Gdiplus::Image* m_backgroundImage2 = nullptr;
     ULONGLONG m_lastRenderMs = 0;
+    HDC m_memDC = nullptr;
+    HBITMAP m_bitmap = nullptr;
+    HBITMAP m_originalBitmap = nullptr;
+    void* m_bitmapBits = nullptr;
+    int m_bitmapWidth = 0;
+    int m_bitmapHeight = 0;
+    BYTE m_windowAlpha = 255;
+    BYTE m_fadeStartAlpha = 255;
+    BYTE m_fadeTargetAlpha = 255;
+    ULONGLONG m_fadeStartMs = 0;
+    bool m_alphaAnimating = false;
+    bool m_hideAfterFade = false;
     bool m_trayAdded = false;
 };

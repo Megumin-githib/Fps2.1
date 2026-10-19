@@ -33,4 +33,5 @@ private:
     std::wstring m_exeName;
     bool m_running = false;
     ULONGLONG m_start100ns = 0;
+    ULONGLONG m_lastCheckMs = 0;
 };
