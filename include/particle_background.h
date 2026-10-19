@@ -1,5 +1,7 @@
 #pragma once
 #include <windows.h>
+#include <objbase.h>
+#include <propidl.h>
 #include <gdiplus.h>
 #include <vector>
 
