@@ -1,7 +1,6 @@
 #include "particle_background.h"
 #include <cstdlib>
 #include <cmath>
-#include <new>
 
 using namespace Gdiplus;
 
@@ -39,7 +38,7 @@ void ParticleBackground::CreateGlowTextures() {
 
     // These tiny radial textures replace dozens of GDI+ paths and gradient
     // brushes that were previously constructed and destroyed on every frame.
-    m_fogTexture = new (std::nothrow) Bitmap(128, 128, PixelFormat32bppPARGB);
+    m_fogTexture = new Bitmap(128, 128, PixelFormat32bppPARGB);
     if (m_fogTexture && m_fogTexture->GetLastStatus() == Ok) {
         Graphics g(m_fogTexture);
         g.SetSmoothingMode(SmoothingModeAntiAlias);
@@ -56,7 +55,7 @@ void ParticleBackground::CreateGlowTextures() {
         m_fogTexture = nullptr;
     }
 
-    m_particleTexture = new (std::nothrow) Bitmap(64, 64, PixelFormat32bppPARGB);
+    m_particleTexture = new Bitmap(64, 64, PixelFormat32bppPARGB);
     if (m_particleTexture && m_particleTexture->GetLastStatus() == Ok) {
         Graphics g(m_particleTexture);
         g.SetSmoothingMode(SmoothingModeAntiAlias);
